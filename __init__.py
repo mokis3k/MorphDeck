@@ -40,6 +40,9 @@ from .common import (
     skv_list_key_names,
     kd_keyframed_names,
     _is_basis_name,
+    INITIAL_VALUES_PROPERTY,
+    capture_initial_shape_key_values,
+    prune_initial_shape_key_values,
 )
 from . import groups
 from . import presets
@@ -144,11 +147,33 @@ def _skv_reset_runtime_caches(*_args):
 def _skv_load_post(*_args):
     _skv_reset_runtime_caches()
 
+    if not hasattr(bpy.data, "scenes"):
+        return
+
     try:
         presets.migrate_legacy_preset_object_refs()
         presets.prepare_preset_metadata()
     except Exception as exc:
         print("MorphDeck: preset metadata preparation failed:", exc)
+
+def _skv_deferred_initialize():
+    if not hasattr(bpy.types.Scene, "skv_global_presets"):
+        return None
+
+    if not hasattr(bpy.data, "scenes"):
+        return 0.1
+
+    _skv_load_post()
+
+    scene = getattr(bpy.context, "scene", None)
+
+    if scene is not None:
+        try:
+            _auto_process_active_object(scene)
+        except Exception as exc:
+            print("MorphDeck: deferred initialization failed:", exc)
+
+    return None
 
 def _shape_key_signature(obj) -> str:
     if not obj or getattr(obj, "type", None) != "MESH":
@@ -207,6 +232,12 @@ def _sync_shape_key_rename_mappings(scene, obj, key_data, previous_signature: st
         # If both names still exist, this is likely a reorder or ambiguous change.
         if old_name in new_set or new_name in old_set:
             continue
+
+        saved = key_data.get(INITIAL_VALUES_PROPERTY)
+
+        if saved is not None and old_name in saved:
+            saved[new_name] = float(saved[old_name])
+            del saved[old_name]
 
         try:
             if hasattr(key_data, "skv_key_groups"):
@@ -367,6 +398,7 @@ def _auto_process_active_object(scene, updated_ids=None):
             return
 
         kd_prune_favorites(key_data)
+        prune_initial_shape_key_values(key_data)
 
         if object_changed:
             basis_name = ""
@@ -472,6 +504,11 @@ def _depsgraph_update_post(scene, depsgraph):
             for item in enabled:
                 kb = keys.get((item.name or "").strip())
                 if kb is None:
+                    continue
+
+                if presets.animation_policy.owners({
+                    (data.as_pointer(), kb.name): (data, kb),
+                }):
                     continue
 
                 value = float(kb.value)
@@ -648,6 +685,9 @@ class SKV_OT_InitializeObject(Operator):
                     "Addon storage was not initialized."
                 )
 
+            capture_initial_shape_key_values(
+                get_shape_key_data(obj)
+            )
             context.scene.skv_props.object_pick = obj
 
             skv_sync_shape_key_list_indices(
@@ -671,6 +711,166 @@ class SKV_OT_InitializeObject(Operator):
             tag_redraw_view3d(context)
             return {"FINISHED"}
 
+        tag_redraw_view3d(context)
+        return {"FINISHED"}
+
+class SKV_OT_ResetInitialValues(Operator):
+    bl_idname = "skv.reset_initial_values"
+    bl_label = "Reset Values"
+    bl_description = (
+        "Restore values captured during initialization; "
+        "shape keys added later are reset to zero"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    target: PointerProperty(
+        type=bpy.types.Object,
+        options={"HIDDEN", "SKIP_SAVE"},
+    )
+
+    capture_missing: BoolProperty(
+        default=False,
+        options={"HIDDEN", "SKIP_SAVE"},
+    )
+
+    @classmethod
+    def poll(cls, context):
+        props = getattr(context.scene, "skv_props", None)
+        obj = getattr(props, "object_pick", None)
+        data = get_shape_key_data(obj) if obj else None
+
+        return bool(
+            obj
+            and obj.type == "MESH"
+            and data
+            and len(data.key_blocks) > 1
+            and data.library is None
+            and is_initialized(data)
+        )
+
+    def invoke(self, context, event):
+        self.target = context.scene.skv_props.object_pick
+        self.capture_missing = False
+
+        data = get_shape_key_data(self.target)
+
+        if data.get(INITIAL_VALUES_PROPERTY) is None:
+            self.capture_missing = True
+            return context.window_manager.invoke_props_dialog(
+                self,
+                width=460,
+            )
+
+        return self.execute(context)
+
+    def draw(self, context):
+        self.layout.label(
+            text="This object has no saved initial values.",
+            icon="INFO",
+        )
+        self.layout.label(
+            text="Save its current shape key values as initial values?"
+        )
+        self.layout.label(
+            text="No values will be reset during this operation."
+        )
+
+    def execute(self, context):
+        current_obj = context.scene.skv_props.object_pick
+        obj = self.target if self.target is not None else current_obj
+
+        if obj is None or obj != current_obj:
+            self.report(
+                {"ERROR"},
+                "The selected object changed. Run Reset Values again.",
+            )
+            return {"CANCELLED"}
+
+        data = get_shape_key_data(obj)
+
+        if (
+            data is None
+            or data.library is not None
+            or not is_initialized(data)
+        ):
+            return {"CANCELLED"}
+
+        saved = data.get(INITIAL_VALUES_PROPERTY)
+
+        if saved is None:
+            if not self.capture_missing:
+                self.report(
+                    {"ERROR"},
+                    "Initial values have not been saved.",
+                )
+                return {"CANCELLED"}
+
+            try:
+                capture_initial_shape_key_values(data)
+            except Exception as exc:
+                self.report({"ERROR"}, str(exc))
+                return {"CANCELLED"}
+
+            self.report({"INFO"}, "Initial shape key values saved.")
+            tag_redraw_view3d(context)
+            return {"FINISHED"}
+
+        targets = [
+            (
+                kb,
+                float(saved.get(kb.name, 0.0)),
+            )
+            for kb in data.key_blocks[1:]
+        ]
+
+        invalid = [
+            kb.name
+            for kb, value in targets
+            if value < kb.slider_min or value > kb.slider_max
+        ]
+
+        if invalid:
+            self.report(
+                {"ERROR"},
+                "Reset values are outside current slider limits: "
+                + ", ".join(invalid),
+            )
+            return {"CANCELLED"}
+
+        previous = [
+            (kb, float(kb.value))
+            for kb, _value in targets
+        ]
+
+        try:
+            for kb, value in targets:
+                if float(kb.value) != value:
+                    kb.value = value
+
+        except Exception as exc:
+            restore_errors = []
+
+            for kb, value in previous:
+                try:
+                    kb.value = value
+                except Exception as restore_error:
+                    restore_errors.append(str(restore_error))
+
+            message = str(exc)
+
+            if restore_errors:
+                message += (
+                    "; rollback incomplete: "
+                    + "; ".join(restore_errors)
+                )
+
+            self.report({"ERROR"}, message)
+            return {"FINISHED"}
+
+        self.report(
+            {"INFO"},
+            f"Reset values for {len(targets)} shape keys.",
+        )
         tag_redraw_view3d(context)
         return {"FINISHED"}
 
@@ -1185,6 +1385,11 @@ class SKV_PT_ShapeKeysPanel(Panel):
         top_actions = layout.row(align=True)
         top_actions.operator("skv.transfer_from", text="Transfer from", icon="IMPORT")
         top_actions.operator("skv.synchronize_values", text="Synchronize values", icon="FILE_REFRESH")
+        top_actions.operator(
+            "skv.reset_initial_values",
+            text="Reset Values",
+            icon="LOOP_BACK",
+        )
 
         current_group = get_selected_group_name(key_data) or INIT_GROUP_NAME
 
@@ -1610,6 +1815,20 @@ class SKV_PT_PresetsPanel(Panel):
             )
 
         if gpreset:
+            conflict = presets.animation_policy.conflict_message(
+                gpreset
+            )
+
+            if conflict:
+                warning_box = presets_col.box()
+                warning_box.label(
+                    text=conflict,
+                    icon="ERROR",
+                )
+                warning_box.label(
+                    text="Use Auto Keyframe buttons to resolve the conflict."
+                )
+
             found = presets.find_preset_control(gpreset)
             legacy = presets.preset_has_legacy_animation(
                 scene,
@@ -1735,6 +1954,7 @@ class SKV_PT_PresetsPanel(Panel):
 
 _LOCAL_CLASSES = (
     SKV_OT_InitializeObject,
+    SKV_OT_ResetInitialValues,
     SKV_OT_SearchClear,
     SKV_OT_SynchronizeValues,
     SKV_OT_ShapeKeyAdd,
@@ -1767,7 +1987,8 @@ _SKV_OPERATOR_DESCRIPTIONS = {
         "Enable or disable this shape key's contribution to the mesh",
 
     "skv.auto_keyframe_toggle":
-        "Enable or disable automatic keyframes for this shape key",
+        "Toggle individual Auto Keyframe; deleting animation or removing "
+        "the shape key from animated presets requires confirmation",
 
     "skv.key_toggle_select":
         "Select or deselect this shape key for list actions",
@@ -1840,10 +2061,12 @@ _SKV_OPERATOR_DESCRIPTIONS = {
         "Enable or disable all shape keys belonging to this preset",
 
     "skv.preset_toggle_auto_keyframe":
-        "Enable or disable Auto Keyframe for all shape keys in this preset",
+        "Record the preset value automatically; disabling requires "
+        "confirmation to delete its animation",
 
     "skv.add_selected_to_preset":
-        "Add the selected shape keys to the chosen preset",
+        "Add selected shape keys; replacing conflicting individual "
+        "animation requires confirmation",
 
     "skv.global_preset_add_empty":
         "Create an empty preset",
@@ -2008,16 +2231,17 @@ def register():
 
 
     _ensure_handler_installed()
-    _skv_load_post()
-    try:
-        scene = bpy.context.scene
-    except Exception:
-        scene = None
-    if scene is not None:
-        _auto_process_active_object(scene)
+
+    if not bpy.app.timers.is_registered(_skv_deferred_initialize):
+        bpy.app.timers.register(
+            _skv_deferred_initialize,
+            first_interval=0.1,
+        )
 
 
 def unregister():
+    if bpy.app.timers.is_registered(_skv_deferred_initialize):
+        bpy.app.timers.unregister(_skv_deferred_initialize)
     _ensure_handler_removed()
 
 

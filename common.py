@@ -2,6 +2,46 @@ import re
 
 INIT_GROUP_NAME = "Main"
 
+INITIAL_VALUES_PROPERTY = "skv_initial_shape_key_values"
+
+
+def capture_initial_shape_key_values(key_data):
+    """Capture the initial values once per shape key datablock."""
+    if key_data is None or not key_data.key_blocks:
+        raise RuntimeError("No shape keys available.")
+
+    if key_data.library is not None:
+        raise RuntimeError("Shape key datablock is linked (read-only).")
+
+    if key_data.get(INITIAL_VALUES_PROPERTY) is not None:
+        return False
+
+    key_data[INITIAL_VALUES_PROPERTY] = {
+        kb.name: float(kb.value)
+        for kb in key_data.key_blocks[1:]
+    }
+
+    return True
+
+
+def prune_initial_shape_key_values(key_data):
+    """Remove saved values for shape keys that no longer exist."""
+    if key_data is None or key_data.library is not None:
+        return
+
+    saved = key_data.get(INITIAL_VALUES_PROPERTY)
+    if saved is None:
+        return
+
+    existing = {
+        kb.name
+        for kb in key_data.key_blocks[1:]
+    }
+
+    for name in list(saved.keys()):
+        if name not in existing:
+            del saved[name]
+
 
 # Utilities
 def get_active_object(context):

@@ -1,4 +1,5 @@
 import bpy
+from . import animation_policy
 from bpy.types import (
     Operator,
     PropertyGroup,
@@ -100,28 +101,96 @@ def _ensure_group_exists(key_data, group_name: str) -> bool:
         return False
 
 
-def inherit_transferred_groups(source_obj, target_obj, key_names) -> int:
-    # Copy source group mapping to target for transferred shape keys.
+def inherit_transferred_favorites(
+    source_obj,
+    target_obj,
+    key_names,
+) -> int:
     if not source_obj or not target_obj or source_obj == target_obj:
         return 0
-    if getattr(source_obj, "type", None) != "MESH" or getattr(target_obj, "type", None) != "MESH":
+
+    source_data = get_shape_key_data(source_obj)
+    target_data = get_shape_key_data(target_obj)
+
+    if source_data is None or target_data is None:
+        return 0
+
+    if source_data == target_data:
+        return 0
+
+    if target_data.library is not None:
+        return 0
+
+    source_entries = getattr(source_data, "skv_favorites", None)
+    target_entries = getattr(target_data, "skv_favorites", None)
+
+    if source_entries is None or target_entries is None:
+        return 0
+
+    transferred_names = set(key_names or ())
+    existing_names = {item.name for item in target_entries}
+    added = 0
+
+    # Preserve source order and keep existing target favorites.
+    for item in source_entries:
+        name = item.name
+
+        if name not in transferred_names or name in existing_names:
+            continue
+
+        if (
+            source_data.key_blocks.get(name) is None
+            or target_data.key_blocks.get(name) is None
+            or _is_basis_name(source_data, name)
+            or _is_basis_name(target_data, name)
+        ):
+            continue
+
+        target_entries.add().name = name
+        existing_names.add(name)
+        added += 1
+
+    return added
+
+def inherit_transferred_groups(
+    source_obj,
+    target_obj,
+    key_names,
+) -> int:
+    if not source_obj or not target_obj or source_obj == target_obj:
+        return 0
+
+    if (
+        getattr(source_obj, "type", None) != "MESH"
+        or getattr(target_obj, "type", None) != "MESH"
+    ):
         return 0
 
     source_key_data = get_shape_key_data(source_obj)
-
-    names = [n for n in (key_names or []) if n and not _is_basis_name(source_key_data, n)]
-    if not names:
-        return 0
-
     target_key_data = get_shape_key_data(target_obj)
 
-    if not source_key_data or not target_key_data:
+    if source_key_data is None or target_key_data is None:
         return 0
-    if not getattr(source_key_data, "key_blocks", None) or not getattr(target_key_data, "key_blocks", None):
+
+    if not source_key_data.key_blocks or not target_key_data.key_blocks:
         return 0
-    if not has_group_storage(source_key_data) or not has_group_storage(target_key_data):
+
+    if (
+        not has_group_storage(source_key_data)
+        or not has_group_storage(target_key_data)
+    ):
         return 0
-    if getattr(target_key_data, "library", None) is not None:
+
+    if target_key_data.library is not None:
+        return 0
+
+    names = [
+        name
+        for name in (key_names or ())
+        if name and not _is_basis_name(source_key_data, name)
+    ]
+
+    if not names:
         return 0
 
     ensure_init_setup_write(target_obj)
@@ -130,26 +199,37 @@ def inherit_transferred_groups(source_obj, target_obj, key_names) -> int:
     changed = 0
 
     for key_name in names:
-        if not source_key_data.key_blocks.get(key_name):
+        if source_key_data.key_blocks.get(key_name) is None:
             continue
-        if not target_key_data.key_blocks.get(key_name):
+
+        if target_key_data.key_blocks.get(key_name) is None:
             continue
 
         source_group = kd_get_group(source_key_data, key_name)
 
         if source_group not in source_to_target_group:
-            target_group = _make_transfer_group_name(source_group, source_obj, target_key_data)
+            target_group = _make_transfer_group_name(
+                source_group,
+                source_obj,
+                target_key_data,
+            )
+
             if not _ensure_group_exists(target_key_data, target_group):
                 continue
+
             source_to_target_group[source_group] = target_group
 
-        kd_set_group(target_key_data, key_name, source_to_target_group[source_group])
+        kd_set_group(
+            target_key_data,
+            key_name,
+            source_to_target_group[source_group],
+        )
         changed += 1
 
     ensure_init_setup_write(target_obj)
     _remove_empty_transfer_fallback_group(target_key_data)
-    return changed
 
+    return changed
 
 def _remove_empty_transfer_fallback_group(target_key_data) -> None:
     # Remove the auto-created fallback group if transferred groups already exist
@@ -920,44 +1000,27 @@ class SKV_OT_ShapeKeyToggleVisibility(Operator):
 class SKV_OT_AutoKeyframeToggle(Operator):
     bl_idname = "skv.auto_keyframe_toggle"
     bl_label = "Toggle Auto Keyframe"
+    bl_description = (
+        "Record this shape key automatically; "
+        "animation deletion and preset removal require confirmation"
+    )
     bl_options = {"REGISTER", "UNDO"}
 
-    key_name: StringProperty(name="Key Name", default="")
+    policy_mode = "skv.auto_keyframe_toggle"
 
-    def execute(self, context):
-        obj = get_active_object(context)
-        key_data = get_shape_key_data(obj) if obj else None
-        if not obj or not key_data or not getattr(key_data, "key_blocks", None):
-            return {"CANCELLED"}
-        if getattr(key_data, "library", None) is not None:
-            return {"CANCELLED"}
+    key_name: StringProperty(
+        name="Key Name",
+        default="",
+    )
 
-        name = (self.key_name or "").strip()
-        if not name:
-            return {"CANCELLED"}
+    confirmation_token: StringProperty(
+        default="",
+        options={"HIDDEN", "SKIP_SAVE"},
+    )
 
-        kb = key_data.key_blocks.get(name)
-        if not kb:
-            return {"CANCELLED"}
-
-        entry = _autokf_get_entry(key_data, name, create=True)
-        entry.enabled = not bool(entry.enabled)
-
-        frame = int(context.scene.frame_current)
-        entry.last_frame = frame
-        try:
-            entry.last_value = float(kb.value)
-        except Exception:
-            entry.last_value = 0.0
-
-        if entry.enabled:
-            try:
-                key_data.keyframe_insert(data_path=_shape_key_value_data_path(name), frame=frame)
-            except Exception:
-                pass
-
-        tag_redraw_view3d(context)
-        return {"FINISHED"}
+    invoke = animation_policy.invoke
+    draw = animation_policy.draw
+    execute = animation_policy.execute
 
 
 class SKV_OT_KeyToggleSelect(Operator):
@@ -1219,6 +1282,15 @@ class SKV_OT_DeleteSelectedShapeKeys(Operator):
 
         if not deleted:
             return {"CANCELLED"}
+
+        from .common import INITIAL_Vgit ALUES_PROPERTY
+
+        saved = key_data.get(INITIAL_VALUES_PROPERTY)
+
+        if saved is not None:
+            for name in deleted:
+                if name in saved:
+                    del saved[name]
 
         # Remove references only for successfully deleted keys.
         for attr in (
@@ -1679,6 +1751,12 @@ class SKV_OT_TransferTo(TransferModalMixin, Operator):
             selected_names,
         )
 
+        inherit_transferred_favorites(
+            source,
+            target,
+            selected_names,
+        )
+
         if self._job_inherit_presets:
             presets.inherit_transferred_keys_to_presets(
                 source,
@@ -1828,6 +1906,12 @@ class SKV_OT_TransferFrom(TransferModalMixin, Operator):
                         pass
 
         inherit_transferred_groups(source, target, selected_names)
+
+        inherit_transferred_favorites(
+            source,
+            target,
+            selected_names,
+        )
 
         if self._job_inherit_presets:
             presets.inherit_transferred_keys_to_presets(source, target, selected_names)

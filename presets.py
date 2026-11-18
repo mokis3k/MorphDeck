@@ -1,4 +1,5 @@
 import bpy
+from . import animation_policy
 from bpy.types import (
     Operator,
     PropertyGroup,
@@ -155,6 +156,9 @@ def _preset_item_value_update(self, context):
 def global_preset_apply(preset, context) -> None:
     global _GLOBAL_PRESET_APPLY_GUARD, _PRESET_ITEM_SYNC_GUARD
 
+    if animation_policy.conflict_message(preset):
+        return
+
     if _GLOBAL_PRESET_APPLY_GUARD:
         return
 
@@ -264,23 +268,7 @@ def _preset_all_muted(preset) -> bool:
 
 
 def _preset_all_autokey_enabled(preset) -> bool:
-    maps = {}
-    found = False
-
-    for data, kb in _iter_preset_key_blocks(preset):
-        found = True
-        pointer = data.as_pointer()
-
-        if pointer not in maps:
-            maps[pointer] = {
-                item.name: bool(item.enabled)
-                for item in getattr(data, "skv_auto_keyframes", ())
-            }
-
-        if not maps[pointer].get(kb.name, False):
-            return False
-
-    return found
+    return bool(preset.auto_keyframe_enabled)
 
 
 def preset_item_capture_max_enabled(it) -> bool:
@@ -359,6 +347,19 @@ def add_shape_key_to_preset(preset, obj, key_name: str):
         if preset_item_object(it) == obj and it.key_name == key_name:
             return False
 
+    if animation_policy.animated(preset):
+        candidate = {
+            (key_data.as_pointer(), kb.name): (key_data, kb),
+        }
+
+        if (
+            animation_policy.direct(candidate)
+            or animation_policy.owners(candidate, exclude=preset)
+        ):
+            raise RuntimeError(
+                "Resolve animation conflicts before adding this shape key."
+            )
+
     it = preset.items.add()
     it.object_ref = obj
     it.object_name = obj.name
@@ -373,36 +374,85 @@ def add_shape_key_to_preset(preset, obj, key_name: str):
     return True
 
 
-def inherit_transferred_keys_to_presets(source_obj, target_obj, key_names) -> int:
+def inherit_transferred_keys_to_presets(
+    source_obj,
+    target_obj,
+    key_names,
+) -> int:
     if not source_obj or not target_obj or source_obj == target_obj:
         return 0
-    if getattr(source_obj, "type", None) != "MESH" or getattr(target_obj, "type", None) != "MESH":
+
+    if (
+        getattr(source_obj, "type", None) != "MESH"
+        or getattr(target_obj, "type", None) != "MESH"
+    ):
         return 0
 
-    names = [n for n in (key_names or []) if n]
+    source_data = get_shape_key_data(source_obj)
+    target_data = get_shape_key_data(target_obj)
+
+    if source_data is None or target_data is None:
+        return 0
+
+    if target_data.library is not None:
+        return 0
+
+    names = {
+        name
+        for name in (key_names or ())
+        if name
+        and source_data.key_blocks.get(name) is not None
+        and target_data.key_blocks.get(name) is not None
+        and not _is_basis_name(source_data, name)
+        and not _is_basis_name(target_data, name)
+    }
+
     if not names:
         return 0
 
     scene = bpy.context.scene
-    if not scene or not hasattr(scene, "skv_global_presets"):
+    if scene is None or not hasattr(scene, "skv_global_presets"):
         return 0
 
-    selected_names = set(names)
     inherited_count = 0
 
     for preset in scene.skv_global_presets:
-        source_keys_in_preset = {
-            it.key_name
-            for it in preset.items
-            if preset_item_object(it) == source_obj
-            and it.key_name in selected_names
+        # Capture source values before modifying the item collection.
+        source_maxima = {
+            item.key_name: float(item.max_value)
+            for item in preset.items
+            if preset_item_object(item) == source_obj
+            and item.key_name in names
         }
-        if not source_keys_in_preset:
-            continue
 
-        for key_name in source_keys_in_preset:
-            if add_shape_key_to_preset(preset, target_obj, key_name):
+        for key_name, captured_max in source_maxima.items():
+            target_items = [
+                item
+                for item in preset.items
+                if preset_item_object(item) == target_obj
+                and item.key_name == key_name
+            ]
+
+            if not target_items:
+                if not add_shape_key_to_preset(
+                    preset,
+                    target_obj,
+                    key_name,
+                ):
+                    continue
+
                 inherited_count += 1
+
+                # Reacquire items after adding to the collection.
+                target_items = [
+                    item
+                    for item in preset.items
+                    if preset_item_object(item) == target_obj
+                    and item.key_name == key_name
+                ]
+
+            for item in target_items:
+                item.max_value = captured_max
 
     return inherited_count
 
@@ -493,6 +543,11 @@ class SKV_PresetControl(PropertyGroup):
 
 
 class SKV_GlobalPreset(PropertyGroup):
+    auto_keyframe_enabled: BoolProperty(
+        name="Auto Keyframe",
+        default=False,
+        options=set(),
+    )
     name: StringProperty(name="Preset Name", default="Preset")
     # Identify the preset independently of its name and list position.
     # The control binding is stored separately in control_owner and control_uid.
@@ -815,6 +870,7 @@ class SKV_OT_preset_object_transfer(
         from .groups import (
             inherit_transferred_groups,
             inherit_transferred_keyframes,
+            inherit_transferred_favorites,
         )
 
         scene = self._job_scene
@@ -859,6 +915,12 @@ class SKV_OT_preset_object_transfer(
 
         if created:
             inherit_transferred_groups(source, target, created)
+
+        inherit_transferred_favorites(
+            source,
+            target,
+            resolved,
+        )
 
         copied = 0
         created_preset = None
@@ -956,50 +1018,28 @@ class SKV_OT_preset_toggle_visibility(Operator):
 class SKV_OT_preset_toggle_auto_keyframe(Operator):
     bl_idname = "skv.preset_toggle_auto_keyframe"
     bl_label = "Toggle Preset Auto Keyframe"
+    bl_description = (
+        "Record the preset value automatically; "
+        "disabling requires confirmation to delete its animation"
+    )
     bl_options = {"REGISTER", "UNDO"}
 
-    preset_index: IntProperty(name="Preset Index", default=0)
+    policy_mode = "skv.preset_toggle_auto_keyframe"
 
-    def execute(self, context):
-        scene = context.scene
-        idx = int(self.preset_index)
-        if idx < 0 or idx >= len(scene.skv_global_presets):
-            return {"CANCELLED"}
+    preset_index: IntProperty(
+        name="Preset Index",
+        default=0,
+        min=0,
+    )
 
-        preset = scene.skv_global_presets[idx]
-        target_enabled = not _preset_all_autokey_enabled(preset)
-        frame = int(context.scene.frame_current)
+    confirmation_token: StringProperty(
+        default="",
+        options={"HIDDEN", "SKIP_SAVE"},
+    )
 
-        changed = False
-        for key_data, kb in _iter_preset_key_blocks(preset):
-            if getattr(key_data, "library", None) is not None:
-                continue
-            entry = _autokf_get_entry(key_data, kb.name, create=True)
-            if not entry:
-                continue
-            try:
-                entry.enabled = target_enabled
-                entry.last_frame = frame
-                try:
-                    entry.last_value = float(kb.value)
-                except Exception:
-                    entry.last_value = 0.0
-
-                if target_enabled:
-                    try:
-                        key_data.keyframe_insert(data_path=_shape_key_value_data_path(kb.name), frame=frame)
-                    except Exception:
-                        pass
-
-                changed = True
-            except Exception:
-                pass
-
-        if not changed:
-            return {"CANCELLED"}
-
-        tag_redraw_view3d(context)
-        return {"FINISHED"}
+    invoke = animation_policy.invoke
+    draw = animation_policy.draw
+    execute = animation_policy.execute
 
 
 class SKV_UL_global_presets(UIList):
@@ -1135,69 +1175,28 @@ class SKV_MT_add_to_preset(Menu):
 class SKV_OT_add_selected_to_preset(Operator):
     bl_idname = "skv.add_selected_to_preset"
     bl_label = "Add Selected To Preset"
+    bl_description = (
+        "Add selected shape keys; replacing conflicting "
+        "individual animation requires confirmation"
+    )
     bl_options = {"REGISTER", "UNDO"}
 
-    preset_index: IntProperty(name="Preset Index", default=0, min=0)
+    policy_mode = "skv.add_selected_to_preset"
 
-    @classmethod
-    def poll(cls, context):
-        obj = get_active_object(context)
-        key_data = get_shape_key_data(obj) if obj else None
-        if not key_data or not getattr(key_data, "key_blocks", None):
-            return False
-        if getattr(key_data, "library", None) is not None:
-            return False
-        scene = context.scene
-        if not hasattr(scene, "skv_global_presets") or len(scene.skv_global_presets) == 0:
-            return False
-        return any(not _is_basis_name(key_data, n) for n in kd_selected_set(key_data))
+    preset_index: IntProperty(
+        name="Preset Index",
+        default=0,
+        min=0,
+    )
 
-    def execute(self, context):
-        scene = context.scene
-        obj = get_active_object(context)
-        key_data = get_shape_key_data(obj) if obj else None
-        if not obj or not key_data or not getattr(key_data, "key_blocks", None):
-            return {"CANCELLED"}
+    confirmation_token: StringProperty(
+        default="",
+        options={"HIDDEN", "SKIP_SAVE"},
+    )
 
-        if getattr(key_data, "library", None) is not None:
-            self.report({"ERROR"}, "Shape key datablock is linked (read-only).")
-            return {"CANCELLED"}
-
-        if not is_initialized(key_data):
-            self.report({"INFO"}, "Not initialized.")
-            return {"CANCELLED"}
-
-        if self.preset_index < 0 or self.preset_index >= len(scene.skv_global_presets):
-            return {"CANCELLED"}
-
-        ensure_init_setup_write(obj)
-
-        selected = kd_visible_selected_names(
-            key_data,
-            context.scene.skv_props,
-        )
-        selected = [n for n in selected if n and not _is_basis_name(key_data, n)]
-        if not selected:
-            self.report({"INFO"}, "No selected shape keys.")
-            return {"CANCELLED"}
-
-        preset = scene.skv_global_presets[self.preset_index]
-        added = 0
-        for kname in selected:
-            if add_shape_key_to_preset(preset, obj, kname):
-                added += 1
-
-        if added == 0:
-            self.report({"INFO"}, "Nothing added (already present or invalid).")
-            return {"CANCELLED"}
-
-        try:
-            context.scene.skv_props.presets_open = True
-        except Exception:
-            pass
-
-        tag_redraw_view3d(context)
-        return {"FINISHED"}
+    invoke = animation_policy.invoke
+    draw = animation_policy.draw
+    execute = animation_policy.execute
 
 
 class SKV_OT_GlobalPresetAddEmpty(Operator):
@@ -1579,6 +1578,8 @@ def _control_value_update(ctrl, context):
     previous = _CONTROL_SYNC_GUARD
     _CONTROL_SYNC_GUARD = True
     try:
+        animation_policy.control_changed(ctrl, context)
+
         # Apply shared bindings only in the current scene.
         for owner_scene, preset in _control_users(key, ctrl.name):
             if scene is not None and owner_scene != scene:
@@ -1698,6 +1699,7 @@ def _active_curves(id_data):
 
 
 _PRESET_FIELDS = (
+    "auto_keyframe_enabled",
     "name",
     "uid",
     "control_uid",
