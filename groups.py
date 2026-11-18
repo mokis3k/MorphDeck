@@ -1283,7 +1283,7 @@ class SKV_OT_DeleteSelectedShapeKeys(Operator):
         if not deleted:
             return {"CANCELLED"}
 
-        from .common import INITIAL_Vgit ALUES_PROPERTY
+        from .common import INITIAL_VALUES_PROPERTY
 
         saved = key_data.get(INITIAL_VALUES_PROPERTY)
 
