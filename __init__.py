@@ -717,19 +717,25 @@ class SKV_OT_InitializeObject(Operator):
 class SKV_OT_ResetInitialValues(Operator):
     bl_idname = "skv.reset_initial_values"
     bl_label = "Reset Values"
-    bl_description = (
-        "Restore values captured during initialization; "
-        "shape keys added later are reset to zero"
-    )
+    bl_description = "Reset all non-basis shape key values"
     bl_options = {"REGISTER", "UNDO"}
 
-    target: PointerProperty(
-        type=bpy.types.Object,
+    mode: EnumProperty(
+        name="Reset Mode",
+        items=(
+            ("ZERO", "Zero", "Set all shape key values to zero"),
+            (
+                "INITIAL",
+                "Initial",
+                "Restore saved initial values; reset newer keys to zero",
+            ),
+        ),
+        default="ZERO",
         options={"HIDDEN", "SKIP_SAVE"},
     )
 
-    capture_missing: BoolProperty(
-        default=False,
+    target_name: StringProperty(
+        default="",
         options={"HIDDEN", "SKIP_SAVE"},
     )
 
@@ -748,36 +754,14 @@ class SKV_OT_ResetInitialValues(Operator):
             and is_initialized(data)
         )
 
-    def invoke(self, context, event):
-        self.target = context.scene.skv_props.object_pick
-        self.capture_missing = False
-
-        data = get_shape_key_data(self.target)
-
-        if data.get(INITIAL_VALUES_PROPERTY) is None:
-            self.capture_missing = True
-            return context.window_manager.invoke_props_dialog(
-                self,
-                width=460,
-            )
-
-        return self.execute(context)
-
-    def draw(self, context):
-        self.layout.label(
-            text="This object has no saved initial values.",
-            icon="INFO",
-        )
-        self.layout.label(
-            text="Save its current shape key values as initial values?"
-        )
-        self.layout.label(
-            text="No values will be reset during this operation."
-        )
-
     def execute(self, context):
         current_obj = context.scene.skv_props.object_pick
-        obj = self.target if self.target is not None else current_obj
+
+        obj = (
+            bpy.data.objects.get(self.target_name)
+            if self.target_name
+            else current_obj
+        )
 
         if obj is None or obj != current_obj:
             self.report(
@@ -797,28 +781,19 @@ class SKV_OT_ResetInitialValues(Operator):
 
         saved = data.get(INITIAL_VALUES_PROPERTY)
 
-        if saved is None:
-            if not self.capture_missing:
-                self.report(
-                    {"ERROR"},
-                    "Initial values have not been saved.",
-                )
-                return {"CANCELLED"}
-
-            try:
-                capture_initial_shape_key_values(data)
-            except Exception as exc:
-                self.report({"ERROR"}, str(exc))
-                return {"CANCELLED"}
-
-            self.report({"INFO"}, "Initial shape key values saved.")
-            tag_redraw_view3d(context)
-            return {"FINISHED"}
+        if self.mode == "INITIAL" and saved is None:
+            self.report(
+                {"ERROR"},
+                "No initial shape key values have been saved.",
+            )
+            return {"CANCELLED"}
 
         targets = [
             (
                 kb,
-                float(saved.get(kb.name, 0.0)),
+                float(saved.get(kb.name, 0.0))
+                if self.mode == "INITIAL"
+                else 0.0,
             )
             for kb in data.key_blocks[1:]
         ]
@@ -869,10 +844,44 @@ class SKV_OT_ResetInitialValues(Operator):
 
         self.report(
             {"INFO"},
-            f"Reset values for {len(targets)} shape keys.",
+            f"Reset {len(targets)} shape keys to "
+            f"{'zero' if self.mode == 'ZERO' else 'initial values'}.",
         )
         tag_redraw_view3d(context)
         return {"FINISHED"}
+
+class SKV_MT_ResetValues(bpy.types.Menu):
+    bl_idname = "SKV_MT_reset_values"
+    bl_label = "Reset Values"
+
+    def draw(self, context):
+        layout = self.layout
+        props = getattr(context.scene, "skv_props", None)
+        obj = getattr(props, "object_pick", None)
+        data = get_shape_key_data(obj) if obj else None
+
+        if obj is None or data is None:
+            layout.label(text="No shape keys available")
+            return
+
+        zero = layout.operator(
+            "skv.reset_initial_values",
+            text="Zero",
+        )
+        zero.mode = "ZERO"
+        zero.target_name = obj.name
+
+        initial_row = layout.row()
+        initial_row.enabled = (
+            data.get(INITIAL_VALUES_PROPERTY) is not None
+        )
+
+        initial = initial_row.operator(
+            "skv.reset_initial_values",
+            text="Initial",
+        )
+        initial.mode = "INITIAL"
+        initial.target_name = obj.name
 
 class SKV_OT_SearchClear(Operator):
     bl_idname = "skv.search_clear"
@@ -1385,10 +1394,11 @@ class SKV_PT_ShapeKeysPanel(Panel):
         top_actions = layout.row(align=True)
         top_actions.operator("skv.transfer_from", text="Transfer from", icon="IMPORT")
         top_actions.operator("skv.synchronize_values", text="Synchronize values", icon="FILE_REFRESH")
-        top_actions.operator(
-            "skv.reset_initial_values",
+        reset_row = top_actions.row(align=True)
+        reset_row.enabled = SKV_OT_ResetInitialValues.poll(context)
+        reset_row.menu(
+            "SKV_MT_reset_values",
             text="Reset Values",
-            icon="LOOP_BACK",
         )
 
         current_group = get_selected_group_name(key_data) or INIT_GROUP_NAME
@@ -1955,6 +1965,7 @@ class SKV_PT_PresetsPanel(Panel):
 _LOCAL_CLASSES = (
     SKV_OT_InitializeObject,
     SKV_OT_ResetInitialValues,
+    SKV_MT_ResetValues,
     SKV_OT_SearchClear,
     SKV_OT_SynchronizeValues,
     SKV_OT_ShapeKeyAdd,
