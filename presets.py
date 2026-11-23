@@ -156,6 +156,9 @@ def _preset_item_value_update(self, context):
 def global_preset_apply(preset, context) -> None:
     global _GLOBAL_PRESET_APPLY_GUARD, _PRESET_ITEM_SYNC_GUARD
 
+    if preset.animation_baked:
+        return
+
     if animation_policy.conflict_message(preset):
         return
 
@@ -200,7 +203,7 @@ def global_preset_index_update(self, context):
     tag_redraw_view3d(context)
 
 def global_preset_value_update(self, context):
-    if _CONTROL_SYNC_GUARD:
+    if _CONTROL_SYNC_GUARD or self.animation_baked:
         return
 
     global_preset_apply(self, context)
@@ -457,6 +460,13 @@ def inherit_transferred_keys_to_presets(
     return inherited_count
 
 
+class SKV_BakedChannel(PropertyGroup):
+    key_data: PointerProperty(type=bpy.types.Key)
+    data_path: StringProperty(default="")
+    action_token: StringProperty(default="")
+    slot_identifier: StringProperty(default="")
+
+
 class SKV_GlobalPresetItem(PropertyGroup):
     object_ref: PointerProperty(
         name="Object",
@@ -543,6 +553,15 @@ class SKV_PresetControl(PropertyGroup):
 
 
 class SKV_GlobalPreset(PropertyGroup):
+    baked_channels: CollectionProperty(type=SKV_BakedChannel)
+
+    animation_baked: BoolProperty(
+        name="Baked",
+        description="Native shape key animation replaces live preset control",
+        default=False,
+        options=set(),
+    )
+
     auto_keyframe_enabled: BoolProperty(
         name="Auto Keyframe",
         default=False,
@@ -1019,8 +1038,8 @@ class SKV_OT_preset_toggle_auto_keyframe(Operator):
     bl_idname = "skv.preset_toggle_auto_keyframe"
     bl_label = "Toggle Preset Auto Keyframe"
     bl_description = (
-        "Record the preset value automatically; "
-        "disabling requires confirmation to delete its animation"
+        "Enable or disable automatic keyframe recording "
+        "for the preset value; existing animation is preserved"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -1057,8 +1076,10 @@ class SKV_UL_global_presets(UIList):
         legacy = preset_has_legacy_animation(context.scene, preset)
 
         value_row = row.row(align=True)
-        value_row.enabled = bool(preset.items) and (
-            found is not None or legacy
+        value_row.enabled = (
+                not preset.animation_baked
+                and bool(preset.items)
+                and (found is not None or legacy)
         )
 
         if legacy:
@@ -1087,7 +1108,10 @@ class SKV_UL_global_presets(UIList):
         opv = row.operator("skv.preset_toggle_visibility", text="", icon=vis_icon, emboss=False)
         opv.preset_index = index
 
-        opk = row.operator(
+        autokey_row = row.row(align=True)
+        autokey_row.enabled = not preset.animation_baked
+
+        opk = autokey_row.operator(
             "skv.preset_toggle_auto_keyframe",
             text="",
             icon="KEYINGSET",
@@ -1353,6 +1377,7 @@ class SKV_OT_GlobalPresetAddFromSelected(Operator):
 CLASSES = (
     SKV_PresetControl, # Register the control property group first.
     SKV_GlobalPresetItem,
+    SKV_BakedChannel,
     SKV_GlobalPreset,
     SKV_OT_preset_object_transfer,
     SKV_OT_preset_item_capture_max,
@@ -1381,6 +1406,7 @@ CONTROL_SCHEMA_VERSION = 2
 _CONTROL_SYNC_GUARD = False
 _CONTROL_FRAME_GUARD = False
 _CONTROL_TRANSACTION = None
+_BAKE_RUNNING = False
 
 _SCENE_PRESET_PATH_RE = _re.compile(
     r'^skv_global_presets\[(?:(\d+)|"((?:[^"\\]|\\.)*)")\]\.value$'
@@ -1582,6 +1608,9 @@ def _control_value_update(ctrl, context):
 
         # Apply shared bindings only in the current scene.
         for owner_scene, preset in _control_users(key, ctrl.name):
+            if preset.animation_baked:
+                continue
+
             if scene is not None and owner_scene != scene:
                 continue
 
@@ -1699,6 +1728,7 @@ def _active_curves(id_data):
 
 
 _PRESET_FIELDS = (
+    "animation_baked",
     "auto_keyframe_enabled",
     "name",
     "uid",
@@ -1722,8 +1752,17 @@ def _snapshot_presets(scene):
     return [
         (
             {
-                name: getattr(preset, name)
-                for name in _PRESET_FIELDS
+                **{
+                    name: getattr(preset, name)
+                    for name in _PRESET_FIELDS
+                },
+                "__baked_channels": [
+                    {
+                        name: getattr(entry, name)
+                        for name in _BAKE_CHANNEL_FIELDS
+                    }
+                    for entry in preset.baked_channels
+                ],
             },
             [
                 {
@@ -1759,13 +1798,19 @@ def _restore_presets(scene, snapshot, active_index):
             preset = scene.skv_global_presets.add()
 
             for name, value in fields.items():
-                if name != "items_index":
+                if name not in {"items_index", "__baked_channels"}:
                     setattr(preset, name, value)
 
             for values in items:
                 item = preset.items.add()
                 for name, value in values.items():
                     setattr(item, name, value)
+
+            for values in fields.get("__baked_channels", ()):
+                entry = preset.baked_channels.add()
+
+                for name, value in values.items():
+                    setattr(entry, name, value)
 
             preset.items_index = fields["items_index"]
 
@@ -2560,9 +2605,10 @@ def preset_has_legacy_animation(scene, preset):
 
 
 def scene_has_legacy_preset_animation(scene):
-    """Check all presets without modifying their animation."""
+    """Check live presets for legacy scene-level animation."""
     return any(
-        preset_has_legacy_animation(scene, preset)
+        not preset.animation_baked
+        and preset_has_legacy_animation(scene, preset)
         for preset in scene.skv_global_presets
     )
 
@@ -2721,6 +2767,10 @@ def migrate_scene_preset_animation(scene):
 
     for index in range(count):
         preset = scene.skv_global_presets[index]
+
+        if preset.animation_baked:
+            continue
+
         preset_name = preset.name
         paths = _scene_preset_paths(scene, preset)
 
@@ -2863,6 +2913,9 @@ def apply_animated_presets(scene):
 
         # List order defines priority: the last applied preset wins.
         for preset in getattr(scene, "skv_global_presets", ()):
+            if preset.animation_baked:
+                continue
+
             found = find_preset_control(preset)
 
             if found is not None:
@@ -3027,3 +3080,871 @@ CLASSES += (
     SKV_OT_ControlMigrate,
     SKV_OT_ControlRestore,
 )
+
+def _bake_check_animation(id_data):
+    anim = getattr(id_data, "animation_data", None)
+
+    if anim is None:
+        return
+
+    if anim.nla_tracks or getattr(anim, "use_tweak_mode", False):
+        raise RuntimeError(
+            f"NLA is not supported for Bake: {id_data.name}"
+        )
+
+    if anim.action is not None:
+        if (
+            anim.action_blend_type != "REPLACE"
+            or abs(anim.action_influence - 1.0) > 1e-6
+        ):
+            raise RuntimeError(
+                "Bake requires an active Action "
+                "with Replace and full influence."
+            )
+
+
+def _bake_source(scene, preset):
+    scene_paths = _scene_preset_paths(scene, preset)
+    legacy = _matching_curves(scene, scene_paths)
+    found = find_preset_control(preset)
+
+    if found is not None:
+        key, ctrl = found
+        paths = control_data_paths(key, ctrl)
+        curves = _matching_curves(key, paths)
+
+        if curves and legacy:
+            raise RuntimeError(
+                "Both the scene preset and its control have animation."
+            )
+
+        if not legacy:
+            owner = key
+            value = float(ctrl.value)
+        else:
+            owner = scene
+            paths = scene_paths
+            value = float(preset.value)
+
+    elif preset.control_uid:
+        raise RuntimeError("The preset control is missing.")
+
+    else:
+        owner = scene
+        paths = scene_paths
+        value = float(preset.value)
+
+    _bake_check_animation(owner)
+    curve = _simple_curve(owner, paths)
+
+    if curve is not None:
+        if curve.mute or (
+            curve.group is not None and curve.group.mute
+        ):
+            raise RuntimeError(
+                "Unmute the preset animation before baking."
+            )
+
+    return curve, value
+
+
+def _bake_targets(preset):
+    targets = {}
+
+    for item in preset.items:
+        obj = preset_item_object(item)
+        key = get_shape_key_data(obj) if obj else None
+        kb = key.key_blocks.get(item.key_name) if key else None
+
+        if kb is None or kb == key.key_blocks[0]:
+            raise RuntimeError(
+                f"Invalid preset item: {item.key_name}"
+            )
+
+        _check_writable(key)
+
+        if not key.use_relative:
+            raise RuntimeError(
+                "Bake supports relative shape keys only."
+            )
+
+        _bake_check_animation(key)
+
+        path = _shape_key_value_data_path(kb.name)
+        _reject_nla_and_drivers(key, {path})
+
+        maximum = float(item.max_value)
+        identity = (key.as_pointer(), kb.name)
+
+        if (
+            identity in targets
+            and not _math.isclose(
+                targets[identity][2],
+                maximum,
+            )
+        ):
+            raise RuntimeError(
+                "Conflicting captured values for shared shape key: "
+                + kb.name
+            )
+
+        targets[identity] = (key, kb, maximum, path)
+
+    if not targets:
+        raise RuntimeError(
+            "The preset has no shape keys to bake."
+        )
+
+    others = animation_policy.owners(
+        targets,
+        exclude=preset,
+    )
+
+    if others:
+        raise RuntimeError(
+            "Other animated presets control these shape keys: "
+            + ", ".join(item.name for item in others)
+        )
+
+    return list(targets.values())
+
+
+def _write_baked_curve(
+    key,
+    kb,
+    path,
+    frames,
+    values,
+    transaction,
+):
+    # Preserve endpoints and transitions; remove only exact flat interiors.
+    keep = [
+        index
+        for index in range(len(values))
+        if (
+            index == 0
+            or index == len(values) - 1
+            or not (
+                values[index - 1]
+                == values[index]
+                == values[index + 1]
+            )
+        )
+    ]
+
+    transaction.set_attr(kb, "value", values[0])
+
+    animation_policy.insert(
+        key,
+        path,
+        frames[0],
+    )
+
+    curves = [
+        fc
+        for fc in _active_curves(key)
+        if fc.data_path == path
+    ]
+
+    if len(curves) != 1:
+        raise RuntimeError(
+            f"Cannot locate the baked curve: {kb.name}"
+        )
+
+    fc = curves[0]
+    fc.keyframe_points.clear()
+    fc.keyframe_points.add(len(keep))
+
+    coordinates = [
+        number
+        for index in keep
+        for number in (frames[index], values[index])
+    ]
+    fc.keyframe_points.foreach_set("co", coordinates)
+
+    for point in fc.keyframe_points:
+        point.interpolation = "LINEAR"
+
+    fc.extrapolation = "CONSTANT"
+    fc.update()
+
+    # Verify every sampled frame, including omitted flat-run frames.
+    for frame, value in zip(frames, values):
+        if not _math.isclose(
+            fc.evaluate(frame),
+            value,
+            rel_tol=1e-5,
+            abs_tol=1e-5,
+        ):
+            raise RuntimeError(
+                f"Baked curve verification failed: {kb.name}"
+            )
+
+    return fc
+
+
+class SKV_OT_BakePreset(Operator):
+
+    bl_idname = "skv.bake_preset"
+    bl_label = "Bake Preset to Shape Keys"
+    bl_description = (
+        "Record evaluated shape key values "
+        "over the scene frame range"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    frame_start: IntProperty(
+        default=1,
+        options={"HIDDEN", "SKIP_SAVE"},
+    )
+
+    frame_end: IntProperty(
+        default=250,
+        options={"HIDDEN", "SKIP_SAVE"},
+    )
+
+    preset_token: StringProperty(
+        default="",
+        options={"HIDDEN", "SKIP_SAVE"},
+    )
+
+    has_existing: BoolProperty(
+        default=False,
+        options={"HIDDEN", "SKIP_SAVE"},
+    )
+
+    replace_animation: BoolProperty(
+        name="Replace existing shape key animation",
+        description=(
+            "Replace entire value curves, "
+            "including keys outside the scene range"
+        ),
+        default=False,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        preset = get_active_global_preset(context.scene)
+
+        return bool(
+            preset is not None
+            and preset.items
+            and context.scene.library is None
+            and not _BAKE_RUNNING
+        )
+
+    def invoke(self, context, event):
+        preset = get_active_global_preset(context.scene)
+
+        try:
+            targets = _bake_targets(preset)
+            _bake_source(context.scene, preset)
+        except Exception as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        self.preset_token = str(preset.as_pointer())
+        self.frame_start = context.scene.frame_start
+        self.frame_end = context.scene.frame_end
+        self.replace_animation = False
+
+        self.has_existing = any(
+            _matching_curves(key, {path})
+            for key, kb, maximum, path in targets
+        )
+
+        return context.window_manager.invoke_props_dialog(
+            self,
+            width=440,
+        )
+
+    def draw(self, context):
+        self.layout.label(
+            text=f"Frames: {self.frame_start} - {self.frame_end}"
+        )
+        self.layout.label(
+            text="Bake to shape keys and disable live preset control?"
+        )
+
+        if self.has_existing:
+            self.layout.separator()
+            self.layout.prop(self, "replace_animation")
+            self.layout.label(
+                text="Entire value curves will be replaced.",
+                icon="ERROR",
+            )
+
+    def execute(self, context):
+        global _BAKE_RUNNING
+        global _CONTROL_SYNC_GUARD
+        global _CONTROL_FRAME_GUARD
+
+        scene = context.scene
+        preset = get_active_global_preset(scene)
+
+        try:
+            if _BAKE_RUNNING or _CONTROL_TRANSACTION is not None:
+                raise RuntimeError(
+                    "Another animation operation is running."
+                )
+
+            if (
+                preset is None
+                or str(preset.as_pointer()) != self.preset_token
+            ):
+                raise RuntimeError(
+                    "The selected preset changed. Open Bake again."
+                )
+
+            if self.frame_end < self.frame_start:
+                raise RuntimeError(
+                    "Invalid scene frame range."
+                )
+
+            targets = _bake_targets(preset)
+            source_curve, _constant = _bake_source(
+                scene,
+                preset,
+            )
+
+            existing = [
+                kb.name
+                for key, kb, maximum, path in targets
+                if _matching_curves(key, {path})
+            ]
+
+            if existing and not self.replace_animation:
+                raise RuntimeError(
+                    "Confirm replacement of existing animation: "
+                    + ", ".join(existing)
+                )
+
+            legacy = bool(
+                _matching_curves(
+                    scene,
+                    _scene_preset_paths(scene, preset),
+                )
+            )
+
+            source_control = (
+                find_preset_control(preset)
+                if not legacy
+                else None
+            )
+
+            if (
+                source_curve is not None
+                and source_control is not None
+            ):
+                owner_available = any(
+                    get_shape_key_data(obj) == source_control[0]
+                    for obj in context.view_layer.objects
+                )
+
+                if not owner_available:
+                    raise RuntimeError(
+                        "The animated control owner must be "
+                        "in the current view layer."
+                    )
+
+            if any(
+                not _math.isfinite(maximum)
+                for key, kb, maximum, path in targets
+            ):
+                raise RuntimeError(
+                    "Invalid captured values in the preset."
+                )
+
+        except Exception as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        frames = list(
+            range(self.frame_start, self.frame_end + 1)
+        )
+        recorded = [[] for _target in targets]
+
+        previous_values = [
+            (kb, float(kb.value))
+            for key, kb, maximum, path in targets
+        ]
+
+        keep_frame = scene.frame_current
+        keep_subframe = scene.frame_subframe
+
+        guards = (
+            _BAKE_RUNNING,
+            _CONTROL_SYNC_GUARD,
+            _CONTROL_FRAME_GUARD,
+        )
+
+        _BAKE_RUNNING = True
+        _CONTROL_SYNC_GUARD = True
+        _CONTROL_FRAME_GUARD = True
+
+        committed = False
+        errors = []
+
+        try:
+            keys = {
+                key.as_pointer(): key
+                for key, kb, maximum, path in targets
+            }
+
+            with ControlTransaction(
+                scene,
+                keys.values(),
+            ) as transaction:
+
+                # Remove confirmed output curves from working Action copies.
+                # Original Actions remain available for rollback.
+                for key in keys.values():
+                    paths = {
+                        path
+                        for owner, kb, maximum, path in targets
+                        if owner == key
+                    }
+                    _delete_paths(key, paths)
+
+                for key, kb, maximum, path in targets:
+                    entry = _autokf_get_entry(
+                        key,
+                        kb.name,
+                        create=False,
+                    )
+
+                    if entry is not None:
+                        transaction.set_attr(
+                            entry,
+                            "enabled",
+                            False,
+                        )
+
+                preset.auto_keyframe_enabled = False
+                preset.animation_baked = False
+
+                # Pass 1: evaluate the source and record actual key values.
+                for frame in frames:
+                    scene.frame_set(
+                        frame,
+                        subframe=0.0,
+                    )
+
+                    if source_control is not None:
+                        _set_preset_value_without_apply(
+                            preset,
+                            source_control[1].value,
+                        )
+
+                    if animation_policy.conflict_message(preset):
+                        raise RuntimeError(
+                            "Animation conflict appeared during sampling."
+                        )
+
+                    global_preset_apply(preset, context)
+
+                    for index, target in enumerate(targets):
+                        key, kb, maximum, path = target
+                        value = float(kb.value)
+
+                        if not _math.isfinite(value):
+                            raise RuntimeError(
+                                f"Invalid sampled value: {kb.name}"
+                            )
+
+                        recorded[index].append(value)
+
+                # Pass 2: write curves after every sample is collected.
+                for target, values in zip(targets, recorded):
+                    key, kb, maximum, path = target
+
+                    _write_baked_curve(
+                        key,
+                        kb,
+                        path,
+                        frames,
+                        values,
+                        transaction,
+                    )
+
+                _remember_baked_channels(preset, targets)
+                preset.animation_baked = True
+
+            committed = True
+
+        except Exception as exc:
+            errors.append(str(exc))
+
+        finally:
+            try:
+                scene.frame_set(
+                    keep_frame,
+                    subframe=keep_subframe,
+                )
+
+                if committed and source_control is not None:
+                    _set_preset_value_without_apply(
+                        preset,
+                        source_control[1].value,
+                    )
+
+            except Exception as exc:
+                errors.append(
+                    "Frame restoration failed: " + str(exc)
+                )
+
+            finally:
+                if not committed:
+                    for kb, value in previous_values:
+                        try:
+                            kb.value = value
+                        except Exception as exc:
+                            errors.append(
+                                "Value restoration failed: "
+                                + str(exc)
+                            )
+
+                (
+                    _BAKE_RUNNING,
+                    _CONTROL_SYNC_GUARD,
+                    _CONTROL_FRAME_GUARD,
+                ) = guards
+
+        tag_redraw_view3d(context)
+
+        if errors:
+            self.report(
+                {"ERROR"},
+                "; ".join(errors),
+            )
+            return {"FINISHED"}
+
+        self.report(
+            {"INFO"},
+            f"Baked {len(targets)} shape keys, "
+            f"frames {self.frame_start}-{self.frame_end}.",
+        )
+        return {"FINISHED"}
+
+
+CLASSES += (SKV_OT_BakePreset,)
+
+_BAKE_ACTION_TOKEN = "morphdeck_bake_action_token"
+
+_BAKE_CHANNEL_FIELDS = (
+    "key_data",
+    "data_path",
+    "action_token",
+    "slot_identifier",
+)
+
+
+def rename_baked_channel_paths(key_data, old_name, new_name):
+    old_path = _shape_key_value_data_path(old_name)
+    new_path = _shape_key_value_data_path(new_name)
+
+    for scene in bpy.data.scenes:
+        if scene.library is not None:
+            continue
+
+        for preset in getattr(scene, "skv_global_presets", ()):
+            for entry in preset.baked_channels:
+                if (
+                    entry.key_data == key_data
+                    and entry.data_path == old_path
+                ):
+                    entry.data_path = new_path
+
+
+def _remember_baked_channels(preset, targets):
+    # Preserve records for previously baked keys removed from the preset.
+    records = {
+        (entry.key_data.as_pointer(), entry.data_path): {
+            name: getattr(entry, name)
+            for name in _BAKE_CHANNEL_FIELDS
+        }
+        for entry in preset.baked_channels
+        if entry.key_data is not None
+    }
+
+    for key, kb, maximum, path in targets:
+        anim = key.animation_data
+
+        if anim is None or anim.action is None:
+            raise RuntimeError(
+                "Cannot record the baked Action."
+            )
+
+        # Action copies retain this identifier without adding ID users.
+        token = anim.action.get(_BAKE_ACTION_TOKEN)
+
+        if not token:
+            token = _uuid.uuid4().hex
+            anim.action[_BAKE_ACTION_TOKEN] = token
+
+        slot = getattr(anim, "action_slot", None)
+
+        records[(key.as_pointer(), path)] = {
+            "key_data": key,
+            "data_path": path,
+            "action_token": str(token),
+            "slot_identifier": getattr(slot, "identifier", ""),
+        }
+
+    preset.baked_channels.clear()
+
+    for values in records.values():
+        entry = preset.baked_channels.add()
+
+        for name, value in values.items():
+            setattr(entry, name, value)
+
+
+def _unbake_targets(preset):
+    if not preset.animation_baked or not preset.baked_channels:
+        raise RuntimeError(
+            "No bake record is available. "
+            "Bake this preset again first."
+        )
+
+    if (
+        preset.control_uid
+        and find_preset_control(preset) is None
+    ):
+        raise RuntimeError(
+            "The original preset control is missing."
+        )
+
+    recorded = {}
+
+    for entry in preset.baked_channels:
+        key = entry.key_data
+
+        if key is None:
+            continue
+
+        _check_writable(key)
+
+        path = entry.data_path
+        _reject_nla_and_drivers(key, {path})
+        curves = _matching_curves(key, {path})
+
+        if curves:
+            _bake_check_animation(key)
+
+            anim = key.animation_data
+            slot = getattr(
+                getattr(anim, "action_slot", None),
+                "identifier",
+                "",
+            )
+
+            if (
+                anim.action is None
+                or anim.action.get(_BAKE_ACTION_TOKEN)
+                != entry.action_token
+                or slot != entry.slot_identifier
+            ):
+                raise RuntimeError(
+                    "The baked Action or slot was replaced: "
+                    + key.name
+                )
+
+        recorded[(key.as_pointer(), path)] = (key, path)
+
+    pairs = animation_policy.members(preset)
+
+    if animation_policy.owners(pairs, exclude=preset):
+        raise RuntimeError(
+            "Another animated preset controls these shape keys."
+        )
+
+    for key, kb in animation_policy.direct(pairs):
+        path = _shape_key_value_data_path(kb.name)
+
+        if (key.as_pointer(), path) not in recorded:
+            raise RuntimeError(
+                "Unrelated individual animation would conflict: "
+                + kb.name
+            )
+
+    return list(recorded.values())
+
+
+class SKV_OT_UnbakePreset(Operator):
+    bl_idname = "skv.unbake_preset"
+    bl_label = "Unbake Preset"
+    bl_description = (
+        "Delete recorded baked value curves "
+        "and restore live preset control"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    preset_token: StringProperty(
+        default="",
+        options={"HIDDEN", "SKIP_SAVE"},
+    )
+
+    @classmethod
+    def poll(cls, context):
+        preset = get_active_global_preset(context.scene)
+
+        return bool(
+            preset is not None
+            and preset.animation_baked
+            and not _BAKE_RUNNING
+        )
+
+    def invoke(self, context, event):
+        preset = get_active_global_preset(context.scene)
+
+        try:
+            _unbake_targets(preset)
+        except Exception as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        self.preset_token = str(preset.as_pointer())
+
+        return context.window_manager.invoke_props_dialog(
+            self,
+            width=560,
+        )
+
+    def draw(self, context):
+        self.layout.label(
+            text=(
+                "Delete baked shape key animation "
+                "and restore preset control?"
+            ),
+            icon="QUESTION",
+        )
+        self.layout.label(
+            text="Edits to baked curves will NOT be transferred back"
+        )
+        self.layout.label(
+            text="to the preset animation.",
+            icon="ERROR",
+        )
+        self.layout.label(
+            text=(
+                "Individual Auto Keyframe for these channels "
+                "will be disabled."
+            )
+        )
+
+    def execute(self, context):
+        global _BAKE_RUNNING
+        global _CONTROL_SYNC_GUARD
+        global _CONTROL_FRAME_GUARD
+
+        scene = context.scene
+        preset = get_active_global_preset(scene)
+
+        try:
+            if _BAKE_RUNNING or _CONTROL_TRANSACTION is not None:
+                raise RuntimeError(
+                    "Another animation operation is running."
+                )
+
+            if (
+                preset is None
+                or str(preset.as_pointer()) != self.preset_token
+            ):
+                raise RuntimeError(
+                    "Confirmation is required. Open Unbake again."
+                )
+
+            targets = _unbake_targets(preset)
+
+        except Exception as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        guards = (
+            _BAKE_RUNNING,
+            _CONTROL_SYNC_GUARD,
+            _CONTROL_FRAME_GUARD,
+        )
+
+        _BAKE_RUNNING = True
+        _CONTROL_SYNC_GUARD = True
+        _CONTROL_FRAME_GUARD = True
+
+        try:
+            keys = {
+                key.as_pointer(): key
+                for key, path in targets
+            }
+
+            with ControlTransaction(
+                scene,
+                keys.values(),
+            ) as transaction:
+
+                for key in keys.values():
+                    paths = {
+                        path
+                        for owner, path in targets
+                        if owner == key
+                    }
+
+                    _delete_paths(key, paths)
+
+                    for kb in key.key_blocks[1:]:
+                        path = _shape_key_value_data_path(kb.name)
+
+                        if path not in paths:
+                            continue
+
+                        entry = _autokf_get_entry(
+                            key,
+                            kb.name,
+                            create=False,
+                        )
+
+                        if entry is not None:
+                            transaction.set_attr(
+                                entry,
+                                "enabled",
+                                False,
+                            )
+
+                preset.auto_keyframe_enabled = False
+                preset.animation_baked = False
+                preset.baked_channels.clear()
+
+        except Exception as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"FINISHED"}
+
+        finally:
+            (
+                _BAKE_RUNNING,
+                _CONTROL_SYNC_GUARD,
+                _CONTROL_FRAME_GUARD,
+            ) = guards
+
+        found = find_preset_control(preset)
+
+        if (
+            found is not None
+            and not preset_has_legacy_animation(scene, preset)
+        ):
+            _set_preset_value_without_apply(
+                preset,
+                found[1].value,
+            )
+
+        global_preset_apply(preset, context)
+        tag_redraw_view3d(context)
+
+        self.report(
+            {"INFO"},
+            "Live preset control restored. "
+            "Auto Keyframe remains disabled.",
+        )
+        return {"FINISHED"}
+
+
+CLASSES += (SKV_OT_UnbakePreset,)

@@ -7,6 +7,9 @@ def api():
 
 
 def animated(preset):
+    if preset.animation_baked:
+        return False
+
     p = api()
     found = p.find_preset_control(preset)
 
@@ -118,17 +121,17 @@ def plan(operator, context):
                     f"Remove {kb.name} from "
                     f"{other.id_data.name} / {other.name}"
                 )
-        else:
-            erase = list(pairs.values())
-            messages.append(
-                f"Delete value animation: {key.name} / {kb.name}"
-            )
 
     else:
         if not 0 <= operator.preset_index < len(scene.skv_global_presets):
             raise RuntimeError("Choose a preset.")
 
         preset = scene.skv_global_presets[operator.preset_index]
+        if preset.animation_baked:
+            raise RuntimeError(
+                "This preset is baked. Bake again to update "
+                "its shape key animation."
+            )
 
         if mode == "skv.add_selected_to_preset":
             obj = p.get_active_object(context)
@@ -164,11 +167,6 @@ def plan(operator, context):
             enabling = not preset.auto_keyframe_enabled
             obj = None
 
-            if not enabling:
-                messages.append(
-                    f"Delete preset value animation: {preset.name}"
-                )
-
         if enabling:
             if not pairs:
                 raise RuntimeError(
@@ -203,7 +201,7 @@ def plan(operator, context):
             key, ctrl = found
             keys[key.as_pointer()] = key
 
-            if mode != "skv.add_selected_to_preset":
+            if mode != "skv.add_selected_to_preset" and enabling:
                 if len(list(p._control_users(key, ctrl.name))) > 1:
                     raise RuntimeError(
                         "This legacy control is shared by several presets."
@@ -219,7 +217,7 @@ def plan(operator, context):
                 "Restore the missing preset control first."
             )
 
-        if mode != "skv.add_selected_to_preset":
+        if mode != "skv.add_selected_to_preset" and enabling:
             paths = p._scene_preset_paths(scene, preset)
             p._reject_nla_and_drivers(scene, paths)
 
@@ -237,7 +235,7 @@ def plan(operator, context):
             {p._shape_key_value_data_path(kb.name)},
         )
 
-    if mode == "skv.auto_keyframe_toggle":
+    if mode == "skv.auto_keyframe_toggle" and enabling:
         p._reject_nla_and_drivers(
             key,
             {p._shape_key_value_data_path(kb.name)},
@@ -505,19 +503,8 @@ def execute(operator, context):
                 insert(key, p.control_data_path(ctrl), frame)
                 preset.auto_keyframe_enabled = True
 
+
             else:
-                found = p.find_preset_control(preset)
-
-                if found:
-                    p._delete_paths(
-                        found[0],
-                        p.control_data_paths(*found),
-                    )
-
-                p._delete_paths(
-                    context.scene,
-                    p._scene_preset_paths(context.scene, preset),
-                )
                 preset.auto_keyframe_enabled = False
 
     except Exception as exc:
@@ -537,7 +524,9 @@ def control_changed(ctrl, context):
     users = [
         preset
         for scene, preset in p._control_users(ctrl.id_data, ctrl.name)
-        if scene == context.scene and preset.auto_keyframe_enabled
+        if scene == context.scene
+           and preset.auto_keyframe_enabled
+           and not preset.animation_baked
     ]
 
     if not users or any(conflict_message(preset) for preset in users):

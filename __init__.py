@@ -233,6 +233,12 @@ def _sync_shape_key_rename_mappings(scene, obj, key_data, previous_signature: st
         if old_name in new_set or new_name in old_set:
             continue
 
+        presets.rename_baked_channel_paths(
+            key_data,
+            old_name,
+            new_name,
+        )
+
         saved = key_data.get(INITIAL_VALUES_PROPERTY)
 
         if saved is not None and old_name in saved:
@@ -431,6 +437,9 @@ _SKV_DEPSGRAPH_GUARD = False
 def _depsgraph_update_post(scene, depsgraph):
     global _SKV_DEPSGRAPH_GUARD, _SKV_PRESET_SYNC_TOKEN
 
+    if presets._BAKE_RUNNING:
+        return
+
     if transfer.is_transfer_running():
         return
 
@@ -564,6 +573,8 @@ def _depsgraph_update_post(scene, depsgraph):
 # so animated preset values must be applied explicitly.
 @persistent
 def _frame_change_post(scene, depsgraph=None):
+    if presets._BAKE_RUNNING:
+        return
     if transfer.is_transfer_running():
         return
     try:
@@ -716,23 +727,9 @@ class SKV_OT_InitializeObject(Operator):
 
 class SKV_OT_ResetInitialValues(Operator):
     bl_idname = "skv.reset_initial_values"
-    bl_label = "Reset Values"
-    bl_description = "Reset all non-basis shape key values"
+    bl_label = "Zero all values"
+    bl_description = "Set all non-basis shape key values on this object to zero"
     bl_options = {"REGISTER", "UNDO"}
-
-    mode: EnumProperty(
-        name="Reset Mode",
-        items=(
-            ("ZERO", "Zero", "Set all shape key values to zero"),
-            (
-                "INITIAL",
-                "Initial",
-                "Restore saved initial values; reset newer keys to zero",
-            ),
-        ),
-        default="ZERO",
-        options={"HIDDEN", "SKIP_SAVE"},
-    )
 
     target_name: StringProperty(
         default="",
@@ -752,6 +749,30 @@ class SKV_OT_ResetInitialValues(Operator):
             and len(data.key_blocks) > 1
             and data.library is None
             and is_initialized(data)
+        )
+
+    def invoke(self, context, event):
+        obj = context.scene.skv_props.object_pick
+
+        if obj is None:
+            return {"CANCELLED"}
+
+        self.target_name = obj.name
+
+        return context.window_manager.invoke_props_dialog(
+            self,
+            width=400,
+        )
+
+    def draw(self, context):
+        self.layout.label(
+            text="Set all shape key values to zero?",
+            icon="QUESTION",
+        )
+        self.layout.label(text=f"Object: {self.target_name}")
+        self.layout.label(
+            text="This affects all non-basis shape keys, "
+            "regardless of selection."
         )
 
     def execute(self, context):
@@ -779,22 +800,8 @@ class SKV_OT_ResetInitialValues(Operator):
         ):
             return {"CANCELLED"}
 
-        saved = data.get(INITIAL_VALUES_PROPERTY)
-
-        if self.mode == "INITIAL" and saved is None:
-            self.report(
-                {"ERROR"},
-                "No initial shape key values have been saved.",
-            )
-            return {"CANCELLED"}
-
         targets = [
-            (
-                kb,
-                float(saved.get(kb.name, 0.0))
-                if self.mode == "INITIAL"
-                else 0.0,
-            )
+            (kb, 0.0)
             for kb in data.key_blocks[1:]
         ]
 
@@ -844,44 +851,11 @@ class SKV_OT_ResetInitialValues(Operator):
 
         self.report(
             {"INFO"},
-            f"Reset {len(targets)} shape keys to "
-            f"{'zero' if self.mode == 'ZERO' else 'initial values'}.",
+            f"Set {len(targets)} shape key values to zero.",
         )
         tag_redraw_view3d(context)
         return {"FINISHED"}
 
-class SKV_MT_ResetValues(bpy.types.Menu):
-    bl_idname = "SKV_MT_reset_values"
-    bl_label = "Reset Values"
-
-    def draw(self, context):
-        layout = self.layout
-        props = getattr(context.scene, "skv_props", None)
-        obj = getattr(props, "object_pick", None)
-        data = get_shape_key_data(obj) if obj else None
-
-        if obj is None or data is None:
-            layout.label(text="No shape keys available")
-            return
-
-        zero = layout.operator(
-            "skv.reset_initial_values",
-            text="Zero",
-        )
-        zero.mode = "ZERO"
-        zero.target_name = obj.name
-
-        initial_row = layout.row()
-        initial_row.enabled = (
-            data.get(INITIAL_VALUES_PROPERTY) is not None
-        )
-
-        initial = initial_row.operator(
-            "skv.reset_initial_values",
-            text="Initial",
-        )
-        initial.mode = "INITIAL"
-        initial.target_name = obj.name
 
 class SKV_OT_SearchClear(Operator):
     bl_idname = "skv.search_clear"
@@ -1394,11 +1368,9 @@ class SKV_PT_ShapeKeysPanel(Panel):
         top_actions = layout.row(align=True)
         top_actions.operator("skv.transfer_from", text="Transfer from", icon="IMPORT")
         top_actions.operator("skv.synchronize_values", text="Synchronize values", icon="FILE_REFRESH")
-        reset_row = top_actions.row(align=True)
-        reset_row.enabled = SKV_OT_ResetInitialValues.poll(context)
-        reset_row.menu(
-            "SKV_MT_reset_values",
-            text="Reset Values",
+        top_actions.operator(
+            "skv.reset_initial_values",
+            text="Zero all values",
         )
 
         current_group = get_selected_group_name(key_data) or INIT_GROUP_NAME
@@ -1811,6 +1783,37 @@ class SKV_PT_PresetsPanel(Panel):
             col.operator("skv.global_preset_add_empty", icon="ADD", text="")
             col.operator("skv.global_preset_remove", icon="REMOVE", text="")
 
+            bake_row = presets_col.row()
+
+            can_unbake = bool(
+                gpreset is not None
+                and gpreset.animation_baked
+                and gpreset.baked_channels
+            )
+
+            if can_unbake:
+                bake_row.operator(
+                    "skv.unbake_preset",
+                    text="Unbake Preset",
+                )
+            else:
+                bake_row.operator(
+                    "skv.bake_preset",
+                    text="Bake Preset to Shape Keys",
+                )
+
+            if gpreset is not None and gpreset.animation_baked:
+                if gpreset.baked_channels:
+                    presets_col.label(
+                        text="Baked: native shape key animation is active.",
+                        icon="INFO",
+                    )
+                else:
+                    presets_col.label(
+                        text="Bake again to enable Unbake for this preset.",
+                        icon="INFO",
+                    )
+
         gpreset = presets.get_active_global_preset(scene)
 
         if presets.scene_has_legacy_preset_animation(scene):
@@ -1965,7 +1968,6 @@ class SKV_PT_PresetsPanel(Panel):
 _LOCAL_CLASSES = (
     SKV_OT_InitializeObject,
     SKV_OT_ResetInitialValues,
-    SKV_MT_ResetValues,
     SKV_OT_SearchClear,
     SKV_OT_SynchronizeValues,
     SKV_OT_ShapeKeyAdd,
@@ -1998,8 +2000,9 @@ _SKV_OPERATOR_DESCRIPTIONS = {
         "Enable or disable this shape key's contribution to the mesh",
 
     "skv.auto_keyframe_toggle":
-        "Toggle individual Auto Keyframe; deleting animation or removing "
-        "the shape key from animated presets requires confirmation",
+        "Enable or disable automatic keyframe recording; existing "
+        "animation is preserved. Removing a shape key from animated "
+        "presets requires confirmation",
 
     "skv.key_toggle_select":
         "Select or deselect this shape key for list actions",
@@ -2072,8 +2075,8 @@ _SKV_OPERATOR_DESCRIPTIONS = {
         "Enable or disable all shape keys belonging to this preset",
 
     "skv.preset_toggle_auto_keyframe":
-        "Record the preset value automatically; disabling requires "
-        "confirmation to delete its animation",
+        "Enable or disable automatic keyframe recording for the "
+        "preset value; existing animation is preserved",
 
     "skv.add_selected_to_preset":
         "Add selected shape keys; replacing conflicting individual "
